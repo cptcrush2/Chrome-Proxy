@@ -1,0 +1,87 @@
+name: Issue auto-close protection
+
+# Belt-and-suspenders for the local commit-msg hook (~/.githooks/commit-msg).
+# The local hook catches keywords at commit time on the dev's machine, but
+# doesn't help if a commit is made elsewhere (other machine, GitHub web UI,
+# squash-merge with a closing keyword in the title). This workflow runs on
+# the server side:
+#
+#   - On `push` to main: scans every commit in the push. If a forbidden
+#     auto-close keyword is found, REOPENS any issues that were just
+#     auto-closed by the keyword and fails the workflow run so the
+#     violation is visible in commit status.
+#   - On pull requests: scans the PR title, body, and every commit. If
+#     keywords are found, fails the check (so it can be required by branch
+#     protection rules).
+#
+# Forbidden keywords (case-insensitive) followed by `#N` or `owner/repo#N`:
+#   close, closes, closed, fix, fixes, fixed, resolve, resolves, resolved
+#
+# See Website-Builder/memory/feedback_issues.md for the policy.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+jobs:
+  protect:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Scan messages and reopen any auto-closed issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -e
+          PATTERN='\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]:]+([a-zA-Z0-9._/-]+)?#[0-9]+'
+
+          # Build a list of "label|message" entries to scan.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            entries=$(jq -r '
+              "PR-title|" + .pull_request.title,
+              "PR-body|" + (.pull_request.body // "")
+            ' "$GITHUB_EVENT_PATH")
+            pr_num=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
+            pr_commits=$(gh pr view "$pr_num" --repo "$REPO" \
+              --json commits -q '.commits[] | "commit-" + (.oid[0:7]) + "|" + .messageHeadline + (if .messageBody and .messageBody != "" then " " + .messageBody else "" end)')
+            entries=$(printf "%s\n%s\n" "$entries" "$pr_commits")
+          else
+            entries=$(jq -r '.commits[] | "commit-" + (.id[0:7]) + "|" + .message' "$GITHUB_EVENT_PATH")
+          fi
+
+          violations=0
+          issue_nums=""
+
+          while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            label="${entry%%|*}"
+            msg="${entry#*|}"
+            if echo "$msg" | grep -qiE "$PATTERN"; then
+              echo "::error::$label contains auto-close keyword: $(echo "$msg" | head -1)"
+              violations=$((violations + 1))
+              ref_nums=$(echo "$msg" | grep -oiE "$PATTERN" | grep -oE '#[0-9]+' | tr -d '#')
+              issue_nums="$issue_nums $ref_nums"
+            fi
+          done <<< "$entries"
+
+          # Reopen affected issues on push to main (PRs are blocked before merge).
+          if [ "$EVENT_NAME" = "push" ] && [ -n "$issue_nums" ]; then
+            for n in $(echo "$issue_nums" | tr ' ' '\n' | sort -u | grep -v '^$'); do
+              echo "::warning::Reopening issue #$n (auto-closed by forbidden keyword)"
+              gh issue reopen "$n" --repo "$REPO" \
+                --comment "Auto-reopened by \`issue-auto-close-protection\` workflow. This issue was closed by a commit using one of GitHub's auto-close keywords (close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved + #N). Per repo convention ([Website-Builder/memory/feedback_issues.md](https://github.com/cptcrush2/Website-Builder/blob/main/memory/feedback_issues.md)), issues must remain OPEN until the user verifies the fix." || true
+            done
+          fi
+
+          if [ "$violations" -gt 0 ]; then
+            echo "::error::Found $violations message(s) with auto-close keywords."
+            exit 1
+          fi
+          echo "✓ No auto-close keywords found in this push/PR."
